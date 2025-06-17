@@ -1,0 +1,148 @@
+#Clustering
+```{r clustering-patients, echo=TRUE}
+library(factoextra)
+
+# Load your team’s gene expression data (without class)
+df <- load_gene_subset(group_number = 7, include_class = FALSE)
+
+# Standardize gene expression values
+df_scaled <- scale(df)
+
+# K-means clustering (patients)
+set.seed(123)
+km <- kmeans(df_scaled, centers = 2, nstart = 25)
+fviz_cluster(km, data = df_scaled, main = "K-means Clustering of Patients")
+
+# Hierarchical clustering (patients)
+dist_matrix <- dist(df_scaled)
+hc <- hclust(dist_matrix, method = "ward.D2")
+
+# Dendrogram of patients
+plot(hc, main = "Hierarchical Clustering (Patients)", xlab = "", sub = "")
+rect.hclust(hc, k = 2, border = "blue")
+
+# Store cluster assignments
+patient_clusters <- cutree(hc, k = 2)
+
+
+# PCA plot of patient data with cluster colors
+library(ggplot2)
+
+# Perform PCA
+pca <- prcomp(df_scaled, center = TRUE, scale. = TRUE)
+
+# Add cluster assignments (from hc)
+patient_clusters <- cutree(hc, k = 2)
+
+# Prepare data frame for ggplot
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  Cluster = as.factor(patient_clusters)
+)
+
+# Plot
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(title = "PCA Plot of Patients Colored by Cluster", x = "PC1", y = "PC2") +
+  theme_minimal()
+
+
+```
+
+```{r clustering-genes, echo=TRUE}
+# Transpose data to cluster genes
+df_gene <- t(df_scaled)
+
+# Compute distance and perform clustering
+dist_genes <- dist(df_gene)
+hc_genes <- hclust(dist_genes, method = "ward.D2")
+
+# Dendrogram of genes
+plot(hc_genes, main = "Hierarchical Clustering (Genes)", xlab = "", sub = "")
+rect.hclust(hc_genes, k = 4, border = "red")  # Optionally cut into 4 clusters
+
+
+# Keep top 50 most variable genes for better visuals
+gene_vars <- apply(df, 2, var)
+top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:50]
+df_subset <- df[, top_genes]
+
+# Cluster these genes
+df_genes <- t(scale(df_subset))
+hc_genes <- hclust(dist(df_genes), method = "ward.D2")
+
+# Plot with trimmed labels
+plot(hc_genes, main = "Hierarchical Clustering (Top 50 Genes)", cex = 0.5)
+rect.hclust(hc_genes, k = 4, border = "red")
+
+```
+
+```{r improve-model-clustering, echo=TRUE}
+
+# -----------------------------
+# QUESTION IV: Does clustering improve the model?
+# -----------------------------
+
+# Load full data with class label
+df_class <- load_gene_subset(group_number = 7, include_class = TRUE)
+
+# Standardize gene expression values (same as Q3)
+df_scaled <- scale(df_class[, setdiff(names(df_class), "Class")])
+
+# Reapply K-means clustering (patients) as done in Q3
+set.seed(123)
+kmeans_model <- kmeans(df_scaled, centers = 2, nstart = 25)
+
+# Add cluster labels to the full dataset
+df_class$Cluster <- as.factor(kmeans_model$cluster)
+df_class$Class <- as.factor(df_class$Class)
+levels(df_class$Class) <- make.names(levels(df_class$Class))  # For caret compatibility
+
+# Create train/test split with same seed for reproducibility
+set.seed(125)
+split_index <- createDataPartition(df_class$Class, p = 0.8, list = FALSE)
+train_df <- df_class[split_index, ]
+test_df  <- df_class[-split_index, ]
+
+# ====================
+# LDA model WITH cluster
+# ====================
+library(MASS)
+lda_model_cluster <- lda(Class ~ ., data = train_df)
+
+# Predict on test data
+lda_pred <- predict(lda_model_cluster, newdata = test_df)
+
+# Confusion matrix
+cm <- confusionMatrix(lda_pred$class, test_df$Class, positive = "X1")
+print(cm)
+
+# Compute AUC
+roc_obj <- roc(test_df$Class, lda_pred$posterior[, "X1"])
+auc_val <- auc(roc_obj)
+
+# Store performance metrics
+metrics_lda_cluster <- data.frame(
+  Model = "LDA + Cluster",
+  Subset = "Test",
+  Accuracy = cm$overall["Accuracy"],
+  Sensitivity = cm$byClass["Sensitivity"],
+  Specificity = cm$byClass["Specificity"],
+  PPV = cm$byClass["Pos Pred Value"],
+  NPV = cm$byClass["Neg Pred Value"],
+  AUC = auc_val,
+  Nfeats = ncol(train_df) - 1
+)
+
+print(metrics_lda_cluster)
+
+add_results(
+  model = "LDA + Cluster",
+  hyperparameter = "with cluster feature",
+  featureselection = FALSE,
+  precision = cm$byClass["Pos Pred Value"],
+  sensitivity = cm$byClass["Sensitivity"],
+  specificity = cm$byClass["Specificity"]
+)
+```

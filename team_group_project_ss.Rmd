@@ -1,0 +1,843 @@
+---
+title: "Group Project"
+output: pdf_document
+date: "2025-06-03"
+---
+
+# FUNCTIONS
+```{r setup, include=FALSE}
+
+library(MASS)
+library(fmsb)
+library(pROC)
+library(dplyr)
+library(caret)
+library(scales) 
+library(glmnet)
+library(ggplot2)
+library(reshape2)
+library(pheatmap)
+library(ranger)
+
+load_gene_subset <- function(group_number,
+                             expression_file = "/Users/macbook/Downloads/Team project Deadline 20 June at noon and Presentations on 19 June (CLAa01) and 20 June (CLAa02)-202/gene-expression-invasive-vs-noninvasive-cancer.csv",
+                             subset_file = "/Users/macbook/Downloads/Team project Deadline 20 June at noon and Presentations on 19 June (CLAa01) and 20 June (CLAa02)-202/teamsubsets.csv",
+                             include_class = TRUE) {
+
+  # Load main dataset
+  dataframe <- read.csv(file = expression_file)
+
+  # Load subset file
+  df_subsets <- read.csv(file = subset_file, sep = ' ')
+
+  # Filter by group number
+  reg_id <- df_subsets[group_number, ]
+
+  # Extract gene indices (remove the ID column)
+  subsets <- as.numeric(reg_id[-1])
+
+  # Filter gene expression dataframe using selected gene indices
+  df <- dataframe[, subsets]
+
+  # Optionally, add class and cancer type
+  if (include_class) {
+    df$Class <- dataframe$Class
+  }
+
+  return(df)
+}
+
+# Initialize empty results data frame
+results_table <- data.frame(
+  Model = character(),
+  Hyperparameter = character(),
+  Precision = numeric(),
+  Sensitivity = numeric(),
+  Specificity = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Define the function
+add_results <- function(model, hyperparameter, featureselection, precision, sensitivity, specificity) {
+  new_row <- data.frame(
+    Model = model,
+    Hyperparameter = hyperparameter,
+    FeatureSelection = featureselection,
+    Precision = precision,
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    stringsAsFactors = FALSE
+  )
+  
+  # Use global assignment to update results_table
+  assign("results_table", rbind(results_table, new_row), envir = .GlobalEnv)
+}
+
+#Read training and testing dataset
+read_gene_data <- function(train_path = "data/train_data.csv", test_path = "data/test_data.csv") {
+  # Read the CSV files
+  train_df <- read.csv(train_path)
+  test_df <- read.csv(test_path)
+  
+  # Split into genes and labels
+  train_genes <- train_df[, !(names(train_df) %in% "Class")]
+  train_labels <- train_df$Class
+  
+  test_genes <- test_df[, !(names(test_df) %in% "Class")]
+  test_labels <- test_df$Class
+  
+  # Return as a list
+  return(list(
+    train_genes = train_genes,
+    train_labels = train_labels,
+    test_genes = test_genes,
+    test_labels = test_labels
+  ))
+}
+
+
+remove_correlated_features <- function(train_data, threshold = 0.8) {
+  # Compute correlation matrix
+  cor_matrix <- cor(train_data, method = "pearson", use = "pairwise.complete.obs")
+  cor_df <- as.data.frame(as.table(cor_matrix))
+  
+  # Remove self-correlations
+  cor_df <- cor_df[cor_df$Var1 != cor_df$Var2, ]
+  
+  # Remove duplicate pairs (symmetry in correlation matrix)
+  cor_df <- cor_df[!duplicated(t(apply(cor_df[, 1:2], 1, sort))), ]
+  
+  # Filter for highly correlated pairs
+  high_cor_df <- cor_df[abs(cor_df$Freq) > threshold, ]
+  
+  # Keep only one variable from each correlated pair
+  genes_to_remove <- unique(high_cor_df$Var2)
+  
+  # Remove redundant features
+  df_reduced <- train_data[, !(colnames(train_data) %in% genes_to_remove)]
+  
+  return(df_reduced)
+}
+
+results <- data.frame(Iteration = integer(),
+                      NumGenes = integer(),
+                      FeatureSelection = logical(),
+                      Precision = double(),
+                      Sensitivity = double(),
+                      Specificity = double(),
+                      Genes = character(),
+                      stringsAsFactors = FALSE)
+
+```
+
+# The goal of feature selection is to highligth those features that have contribution performance towards the prediction variable. 
+# LDA Feature Selection
+```{r setup, include=FALSE}
+
+set.seed(125) 
+# LDA Dimensionality Reduction and Model  -- VERSION 1 
+# Flow chart:LDA feature selection.jpeg
+
+# The approach using LDA for dimensionality reduction is: 
+# 1. Identify contribution performance using LDA to get features weights
+# 2. Standardized Data
+# 3. Random Search for Best Gene Subset
+# 4. Prepare training and test sets with selected genes 
+# 5. Extract metrics
+
+# Load Data
+df <- load_gene_subset(group_number = 7, include_class = TRUE)
+
+# Separate predictors and class
+genes_only <- df[, setdiff(names(df), "Class")]
+labels <- df$Class
+all_genes <- colnames(genes_only)
+
+# Create stratified train/test split
+train_index <- createDataPartition(labels, p = 0.8, list = FALSE)
+
+train_genes <- genes_only[train_index, ]
+test_genes <- genes_only[-train_index, ]
+train_labels <- labels[train_index]
+test_labels <- labels[-train_index]
+
+# Standardize training data
+train_genes <- scale(train_genes)
+
+# ---------- Save Training and Test Data ----------
+# Combine gene expression and class label
+train_df <- data.frame(train_genes, Class = train_labels)
+test_df <- data.frame(test_genes, Class = test_labels)
+
+# Create "data" folder if it doesn't exist
+if (!dir.exists("data")) {
+  dir.create("data")
+}yYe
+
+# Save to CSV files
+write.csv(train_df, "data/train_data.csv", row.names = FALSE)
+write.csv(test_df, "data/test_data.csv", row.names = FALSE)
+# -----------------------------------------------
+
+# ---------- Reading Training and Test Data ----------
+data <- read_gene_data()
+train_genes <- data$train_genes
+train_labels <- data$train_labels
+test_genes <- data$test_genes
+test_labels <- data$test_labels
+# ----------------------------------------------------
+
+
+# === Random Search for Best Gene Subset ===
+n_iter <- 30  # number of random samples
+gene_range <- 10:60  # range of gene subset sizes to try
+results <- data.frame()
+
+for (i in 1:n_iter) {
+  num_genes <- sample(gene_range, 1)
+  selected_genes <- sample(all_genes, num_genes)
+  
+  # Prepare training and test sets with selected genes
+  train_df <- data.frame(train_genes[, selected_genes], Class = train_labels)
+  test_df <- data.frame(test_genes, Class = test_labels)
+  
+  # Compute correlation matrix to avoid collinearity
+  train_df <- remove_correlated_features(train_df)
+  
+  # Fit LDA model
+  lda_model <- tryCatch({
+    lda(Class ~ ., data = train_df)
+  }, error = function(e) return(NULL))
+  
+  if (!is.null(lda_model)) {
+    # Predict on test set
+    test_pred <- predict(lda_model, newdata = test_df)
+    cm_test <- confusionMatrix(as.factor(test_pred$class), as.factor(test_df$Class), positive = "1")
+    
+    # Predict on training set
+    train_pred <- predict(lda_model, newdata = train_df)
+    cm_train <- confusionMatrix(as.factor(train_pred$class), as.factor(train_df$Class), positive = "1")
+    
+    # Extract metrics
+    precision_test <- cm_test$byClass["Pos Pred Value"]
+    sensitivity_test <- cm_test$byClass["Sensitivity"]
+    specificity_test <- cm_test$byClass["Specificity"]
+    
+    precision_train <- cm_train$byClass["Pos Pred Value"]
+    sensitivity_train <- cm_train$byClass["Sensitivity"]
+    specificity_train <- cm_train$byClass["Specificity"]
+    
+    # Append to results
+    results <- rbind(results, data.frame(
+      Iteration = i,
+      NumGenes = num_genes,
+      FeatureSelection = TRUE,
+      
+      Precision_Train = precision_train,
+      Sensitivity_Train = sensitivity_train,
+      Specificity_Train = specificity_train,
+      
+      Precision_Test = precision_test,
+      Sensitivity_Test = sensitivity_test,
+      Specificity_Test = specificity_test,
+      
+      Genes = paste(selected_genes, collapse = ",")
+    )
+    )
+  }
+}
+
+
+# Analyzing the output from the random search
+# Getting rid of those models with higher overfitting
+best_results <- results %>%
+  filter(
+    Precision_Train != 1,
+    Sensitivity_Train != 1,
+    Specificity_Train != 1,
+    Precision_Test != 1,
+    Sensitivity_Test != 1,
+    Specificity_Test != 1
+  ) %>%
+  #Ordering by precision test results
+  arrange(desc(Precision_Test)) %>%
+  
+  #Filter by max precision and max sensitivity to control the trade off by the confusion matrix outputs
+  mutate(
+    max_precision = max(Precision_Test, na.rm = TRUE),
+    max_sensitivity = max(Sensitivity_Test, na.rm = TRUE)
+  ) %>%
+  
+  filter(
+    Precision_Test == max_precision |
+    Sensitivity_Test == max_sensitivity
+  ) %>%
+  
+  dplyr::select(-max_precision, -max_sensitivity)
+
+# Considering the classification metrics Precision, Recall and Specificity and the trade-off between them. The iteration 12th have the best trade-off
+# Precision: 0.7500000, Recall: 0.4285714, Specificity: 0.875, with a Total of 34 Genes as feature Selection. 
+# As recommendation we could evaluate the normality of the features and perform transformation techniques to achieve a higher result.
+
+
+
+# === Plotting LDA ======
+# Choose the best row (you can change this logic if needed)
+best_lda_row <- best_results[1, ]
+
+# Prepare data for prediction again
+selected_genes <- unlist(strsplit(as.character(best_lda_row$Genes), ","))
+
+# Ensure selected genes exist in test set
+lda_test_df <- data.frame(test_genes[, selected_genes], Class = test_labels)
+lda_train_df <- data.frame(train_genes[, selected_genes], Class = train_labels)
+
+
+# Refit LDA model
+lda_model <- lda(Class ~ ., data = lda_train_df)
+lda_pred <- predict(lda_model, newdata = lda_test_df)
+
+# Confusion matrix Test DATA
+cm_lda <- confusionMatrix(
+  data = as.factor(lda_pred$class),
+  reference = as.factor(lda_test_df$Class),
+  positive = "1"
+)
+
+# AUC
+roc_lda <- pROC::roc(response = as.factor(lda_test_df$Class),
+               predictor = lda_pred$posterior[, "1"],
+               levels = rev(levels(as.factor(lda_test_df$Class))))
+auc_lda <- auc(roc_lda)
+
+# Number of features
+nfeats_lda <- length(selected_genes)
+
+# Consolidate results in metrics_lda table
+metrics_lda_test <- data.frame(
+  Model = "LDA",
+  Subset = 'Test',
+  Accuracy = as.numeric(cm_lda$overall["Accuracy"]),
+  Sensitivity = as.numeric(cm_lda$byClass["Sensitivity"]),
+  Specificity = as.numeric(cm_lda$byClass["Specificity"]),
+  PPV = as.numeric(cm_lda$byClass["Pos Pred Value"]),
+  NPV = as.numeric(cm_lda$byClass["Neg Pred Value"]),
+  AUC = as.numeric(auc_lda),
+  Nfeats = as.numeric(nfeats_lda)
+)
+```
+
+# Model:Random Forest  
+# Resample Techinque: K - Fold Cross Validation
+```{r setup, include=FALSE}
+#The following code block is performing a Random forest (RF) using as resampling technique 10 fold cross validation. 
+set.seed(125) 
+
+# Load Data
+df <- load_gene_subset(group_number = 7, include_class = TRUE)
+
+# shuffle data to minimize random effects
+shuffled_df <-  df[sample(nrow(df)),]
+
+# Separate predictors and class
+genes_only <- shuffled_df[, setdiff(names(shuffled_df), "Class")]
+all_genes <- colnames(genes_only)
+
+
+# Create training 80% and test 20%, 
+train <- createDataPartition(shuffled_df$Class, p = 0.8, list = FALSE, times = 1)
+df_train <- shuffled_df[train,]
+df_test <- shuffled_df[-train,]
+
+# 1. Random Forest model using repeated 10-fold cross-validation
+# With regression problems the default value is often  mtry = p3 and for classification mtry=√p
+num_features <- ncol(df_train) - 1
+sqrt_mtry <- floor(sqrt(num_features))
+
+tunegrid_rf <- expand.grid(
+  mtry = c(max(1, sqrt_mtry - 2), sqrt_mtry, sqrt_mtry + 2)
+)
+
+# TrainControl must include classProbs = TRUE
+ctrl <- trainControl(
+  method = "cv",
+  search = "grid",
+  number = 10,
+  classProbs = TRUE,
+  savePredictions = "final",
+  summaryFunction = twoClassSummary
+)
+
+# Target variable is a factor
+df_train$Class <- as.factor(df_train$Class)
+levels(df_train$Class) <- make.names(levels(df_train$Class))
+
+# Train random forest model with tuneGrid and cross-validation
+model_rf <- train(
+  Class ~ .,
+  data = df_train,
+  method = "rf",
+  trControl = ctrl,
+  tuneGrid = expand.grid(mtry = floor(sqrt(ncol(df_train) - 1))),
+  ntree = 100,
+  metric = "ROC"
+)
+
+# === Training Model Stats === 
+roc_obj <- pROC::roc(
+  response = model_rf$pred$obs,
+  predictor = model_rf$pred$X1,  # X1 is the class label "1" after make.names()
+  levels = rev(levels(model_rf$pred$obs))
+)
+
+auc_value_rf <- auc(roc_obj)
+
+# Get predicted classes and true labels
+predictions <- model_rf$pred$pred
+true_labels <- model_rf$pred$obs
+
+# Confusion Matrix
+cm <- confusionMatrix(predictions, true_labels)
+
+metrics_rf_train <- data.frame(
+  Model = "RF",
+  Subset = 'Train',
+  Accuracy = as.numeric(cm$overall["Accuracy"]),
+  Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+  Specificity = as.numeric(cm$byClass["Specificity"]),
+  PPV = as.numeric(cm$byClass["Pos Pred Value"]),
+  NPV = as.numeric(cm$byClass["Neg Pred Value"]),
+  AUC = as.numeric(auc_value_rf),
+  Nfeats = as.numeric(ncol(df_train) - 1 )
+)
+
+# === Test Model Stats ===
+prob_test <- predict(model_rf, newdata = df_test, type = "prob")
+pred_class_test <- predict(model_rf, newdata = df_test, type = "raw")
+
+df_test$Class <- make.names(df_test$Class)
+df_test$Class <- factor(df_test$Class, levels = levels(pred_class_test))
+
+cm_test <- confusionMatrix(
+  pred_class_test,
+  reference = as.factor(df_test$Class), 
+  positive = "X1"
+  )
+
+# AUC
+roc_test_rf <- pROC::roc(response = as.factor(df_test$Class),
+               predictor = prob_test$X1,
+               levels = rev(levels(as.factor(df_test$Class))))
+
+auc_value_rf_test <- auc(roc_test_rf)
+
+metrics_rf_test <- data.frame(
+  Model = "RF",
+  Subset = 'Test',
+  Accuracy = as.numeric(cm_test$overall["Accuracy"]),
+  Sensitivity = as.numeric(cm_test$byClass["Sensitivity"]),
+  Specificity = as.numeric(cm_test$byClass["Specificity"]),
+  PPV = as.numeric(cm_test$byClass["Pos Pred Value"]),
+  NPV = as.numeric(cm_test$byClass["Neg Pred Value"]),
+  AUC = as.numeric(auc_value_rf_test),
+  Nfeats = ncol(df_test) - 1
+)
+```
+
+#Perform SVM using resampling technique 
+```{r setup, include=FALSE}
+
+set.seed(125) 
+# Load Data filter using feature selection from first point 
+df <- load_gene_subset(group_number = 7, include_class = TRUE)
+selected_genes <- unlist(strsplit(best_results$Genes[1], split = ","))
+selected_genes <- trimws(selected_genes)
+
+#Make sure to filter contributing genes and class label in the df_filtered
+df_filtered <- df[, selected_genes, drop = FALSE]
+df_filtered <- df[, c(selected_genes, "Class")]
+
+# Separate predictors and class
+genes_only <- df_filtered[, setdiff(names(df_filtered), "Class")]
+labels <- df_filtered$Class
+all_genes <- colnames(genes_only)
+
+# Create stratified train/test split
+train_index <- createDataPartition(labels, p = 0.8, list = FALSE)
+
+train_genes <- genes_only[train_index, ]
+test_genes <- genes_only[-train_index, ]
+train_labels <- labels[train_index]
+test_labels <- labels[-train_index]
+
+# Standardize training data
+train_genes <- scale(train_genes)
+
+#Combine dataframes
+train_df <- data.frame(train_genes, Class = train_labels)
+test_df <- data.frame(test_genes, Class = test_labels)
+
+# Target variable is a factor
+train_df$Class <- as.factor(train_df$Class)
+levels(train_df$Class) <- make.names(levels(train_df$Class))
+
+# TrainControl must include classProbs = TRUE
+ctrl_svm <- trainControl(
+  method = "cv",
+  search = "grid",
+  number = 10,
+  classProbs = TRUE,
+  savePredictions = "final",
+  summaryFunction = twoClassSummary
+)
+
+# Train SVM model with cross-validation and considering feature selection from LDA 
+model_sv <- train(
+  Class ~ .,
+  data = train_df,
+  method = "svmRadial",
+  trControl = ctrl_svm,
+  ntree = 100,
+  tuneLength = 10,
+  metric = "ROC"
+)
+
+
+roc_obj <- pROC::roc(
+  response = model_sv$pred$obs,
+  predictor = model_sv$pred$X1,  # X1 is the class label "1" after make.names()
+  levels = rev(levels(model_sv$pred$obs))
+)
+
+auc_value_svm <- auc(roc_obj)
+
+# Get predicted classes and true labels
+predictions <- model_sv$pred$pred
+true_labels <- model_sv$pred$obs
+
+# Confusion Matrix
+cm <- confusionMatrix(predictions, true_labels)
+
+metrics_svm_train <- data.frame(
+  Model = "SVM",
+  Subset = 'Train',
+  Accuracy = as.numeric(cm$overall["Accuracy"]),
+  Sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+  Specificity = as.numeric(cm$byClass["Specificity"]),
+  PPV = as.numeric(cm$byClass["Pos Pred Value"]),
+  NPV = as.numeric(cm$byClass["Neg Pred Value"]),
+  AUC = as.numeric(auc_value_svm),
+  Nfeats = as.numeric(ncol(train_df) - 1)
+)
+
+
+# === Test Model Stats ===
+prob_test <- predict(model_sv, newdata = test_df, type = "prob")
+pred_class_test <- predict(model_sv, newdata = test_df, type = "raw")
+#pred_class_test <- factor(pred_class_test, levels = levels(test_df$Class))
+
+test_df$Class <- make.names(test_df$Class)
+test_df$Class <- factor(test_df$Class, levels = levels(pred_class_test))
+
+cm_test <- confusionMatrix(
+  pred_class_test,
+  reference = test_df$Class, 
+  positive = "X1"
+  )
+
+# AUC
+roc_svm <- pROC::roc(response = as.factor(test_df$Class),
+               predictor = prob_test$X1,
+               levels = rev(levels(as.factor(test_df$Class))))
+auc_value_svm <- auc(roc_svm)
+
+metrics_svm_test <- data.frame(
+  Model = "SVM",
+  Subset = 'Test',
+  Accuracy = as.numeric(cm_test$overall["Accuracy"]),
+  Sensitivity = as.numeric(cm_test$byClass["Sensitivity"]),
+  Specificity = as.numeric(cm_test$byClass["Specificity"]),
+  PPV = as.numeric(cm_test$byClass["Pos Pred Value"]),
+  NPV = as.numeric(cm_test$byClass["Neg Pred Value"]),
+  AUC = as.numeric(auc_value_svm),
+  Nfeats = as.numeric(ncol(df_test) - 1)
+)
+
+
+```
+
+# PLOTING RESULTS
+```{r setup, include=FALSE}
+
+# === Setting Up Radar chart plot ===
+metrics_all <- rbind(metrics_lda_test,
+                     metrics_rf_train,
+                     metrics_rf_test,
+                     metrics_svm_train,
+                     metrics_svm_test)
+
+
+
+
+#Normalize all numeric columns 
+normalize_column <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (diff(rng) == 0) {
+    return(rep(0.5, length(x)))  # Constant value case
+  } else {
+    return((x - min(x)) / (max(x) - min(x)))
+  }
+}
+
+normalize_df <- metrics_all %>%
+  dplyr::select(-Model) %>%
+  dplyr::mutate(across(everything(), ~ normalize_column(.x)))
+
+radar_data <- rbind(
+  rep(1, ncol(normalize_df)),  # max values
+  rep(0, ncol(normalize_df)),  # min values
+  normalize_df
+)
+
+rownames(radar_data) <- c("Max", "Min", metrics_all$Model)
+
+# Plot
+colors_border <- c("blue", "red")
+colors_in <- adjustcolor(colors_border, alpha.f = 0.25)
+
+radarchart(
+  radar_data,
+  pcol = colors_border,
+  pfcol = colors_in,
+  plwd = 2,
+  plty = 1,
+  cglcol = "lightgrey",
+  cglty = 1,
+  axislabcol = "lightgrey",
+  caxislabels = seq(0, 1, 0.2),
+  cglwd = 0.8,
+  vlcex = 0.8,
+  title = "Normalized Performance Comparison (RF vs LDA)"
+)
+
+legend(
+  x = "topright", legend = metrics_all$Model,
+  bty = "n", pch = 20, col = colors_border,
+  text.col = "grey40", cex = 0.9, pt.cex = 2
+)
+
+library(fmsb)      # For radar chart
+library(dplyr)     # For data manipulation
+
+# Combine all metrics into a single data frame
+metrics_all <- rbind(metrics_rf, metrics_lda, metrics_svm)
+
+# Normalize function: handles constant columns gracefully
+normalize_column <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (diff(rng) == 0) {
+    return(rep(0.5, length(x)))  # If constant, return 0.5
+  } else {
+    return((x - min(x)) / diff(rng))  # Normalize to 0-1
+  }
+}
+
+# Apply normalization (excluding 'Model')
+metrics_normalized <- metrics_all %>%
+  mutate(across(where(is.numeric) & !all_of("Model"), normalize_column))
+
+# === Plot Each Model Individually ===
+# Define colors
+colors_border <- c("blue", "red", "darkgreen")
+colors_in <- adjustcolor(colors_border, alpha.f = 0.3)
+
+# Set layout: one plot per model
+par(mfrow = c(1, 3), mar = c(2, 2, 2, 2))
+
+for (i in 1:nrow(metrics_normalized)) {
+  model_name <- metrics_normalized$Model[i]
+  values <- metrics_normalized[i, -which(names(metrics_normalized) == "Model")]
+
+  # Prepare radar chart data
+  radar_data <- rbind(
+    rep(1, length(values)),  # max line
+    rep(0, length(values)),  # min line
+    as.numeric(values)
+  )
+
+  rownames(radar_data) <- c("Max", "Min", model_name)
+  colnames(radar_data) <- names(values)
+
+  radarchart(
+    radar_data,
+    axistype = 1,
+    pcol = colors_border[i],
+    pfcol = colors_in[i],
+    plwd = 2,
+    plty = 1,
+    cglcol = "lightgrey",
+    cglty = 1,
+    axislabcol = "lightgrey",
+    caxislabels = seq(0, 1, 0.2),
+    cglwd = 0.8,
+    vlcex = 0.9,
+    title = model_name
+  )
+}
+
+# Reset layout
+par(mfrow = c(1, 1))
+
+
+```
+
+#Clustering
+```{r clustering-patients, echo=TRUE}
+library(factoextra)
+
+# Load your team’s gene expression data (without class)
+df <- load_gene_subset(group_number = 7, include_class = FALSE)
+
+# Standardize gene expression values
+df_scaled <- scale(df)
+
+# K-means clustering (patients)
+set.seed(123)
+km <- kmeans(df_scaled, centers = 2, nstart = 25)
+fviz_cluster(km, data = df_scaled, main = "K-means Clustering of Patients")
+
+# Hierarchical clustering (patients)
+dist_matrix <- dist(df_scaled)
+hc <- hclust(dist_matrix, method = "ward.D2")
+
+# Dendrogram of patients
+plot(hc, main = "Hierarchical Clustering (Patients)", xlab = "", sub = "")
+rect.hclust(hc, k = 2, border = "blue")
+
+# Store cluster assignments
+patient_clusters <- cutree(hc, k = 2)
+
+
+# PCA plot of patient data with cluster colors
+library(ggplot2)
+
+# Perform PCA
+pca <- prcomp(df_scaled, center = TRUE, scale. = TRUE)
+
+# Add cluster assignments (from hc)
+patient_clusters <- cutree(hc, k = 2)
+
+# Prepare data frame for ggplot
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  Cluster = as.factor(patient_clusters)
+)
+
+# Plot
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(title = "PCA Plot of Patients Colored by Cluster", x = "PC1", y = "PC2") +
+  theme_minimal()
+
+
+
+```
+```{r clustering-genes, echo=TRUE}
+# Transpose data to cluster genes
+df_gene <- t(df_scaled)
+
+# Compute distance and perform clustering
+dist_genes <- dist(df_gene)
+hc_genes <- hclust(dist_genes, method = "ward.D2")
+
+# Dendrogram of genes
+plot(hc_genes, main = "Hierarchical Clustering (Genes)", xlab = "", sub = "")
+rect.hclust(hc_genes, k = 4, border = "red")  # Optionally cut into 4 clusters
+
+
+# Keep top 50 most variable genes for better visuals
+gene_vars <- apply(df, 2, var)
+top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:50]
+df_subset <- df[, top_genes]
+
+# Cluster these genes
+df_genes <- t(scale(df_subset))
+hc_genes <- hclust(dist(df_genes), method = "ward.D2")
+
+# Plot with trimmed labels
+plot(hc_genes, main = "Hierarchical Clustering (Top 50 Genes)", cex = 0.5)
+rect.hclust(hc_genes, k = 4, border = "red")
+
+
+
+```
+
+```{r improve-model-clustering, echo=TRUE}
+
+# -----------------------------
+# QUESTION IV: Does clustering improve the model?
+# -----------------------------
+
+# Load full data with class label
+df_class <- load_gene_subset(group_number = 7, include_class = TRUE)
+
+# Standardize gene expression values (same as Q3)
+df_scaled <- scale(df_class[, setdiff(names(df_class), "Class")])
+
+# Reapply K-means clustering (patients) as done in Q3
+set.seed(123)
+kmeans_model <- kmeans(df_scaled, centers = 2, nstart = 25)
+
+# Add cluster labels to the full dataset
+df_class$Cluster <- as.factor(kmeans_model$cluster)
+df_class$Class <- as.factor(df_class$Class)
+levels(df_class$Class) <- make.names(levels(df_class$Class))  # For caret compatibility
+
+# Create train/test split with same seed for reproducibility
+set.seed(125)
+split_index <- createDataPartition(df_class$Class, p = 0.8, list = FALSE)
+train_df <- df_class[split_index, ]
+test_df  <- df_class[-split_index, ]
+
+# ====================
+# LDA model WITH cluster
+# ====================
+library(MASS)
+lda_model_cluster <- lda(Class ~ ., data = train_df)
+
+# Predict on test data
+lda_pred <- predict(lda_model_cluster, newdata = test_df)
+
+# Confusion matrix
+cm <- confusionMatrix(lda_pred$class, test_df$Class, positive = "X1")
+print(cm)
+
+# Compute AUC
+roc_obj <- roc(test_df$Class, lda_pred$posterior[, "X1"])
+auc_val <- auc(roc_obj)
+
+# Store performance metrics
+metrics_lda_cluster <- data.frame(
+  Model = "LDA + Cluster",
+  Subset = "Test",
+  Accuracy = cm$overall["Accuracy"],
+  Sensitivity = cm$byClass["Sensitivity"],
+  Specificity = cm$byClass["Specificity"],
+  PPV = cm$byClass["Pos Pred Value"],
+  NPV = cm$byClass["Neg Pred Value"],
+  AUC = auc_val,
+  Nfeats = ncol(train_df) - 1
+)
+
+print(metrics_lda_cluster)
+
+add_results(
+  model = "LDA + Cluster",
+  hyperparameter = "with cluster feature",
+  featureselection = FALSE,
+  precision = cm$byClass["Pos Pred Value"],
+  sensitivity = cm$byClass["Sensitivity"],
+  specificity = cm$byClass["Specificity"]
+)
+```
